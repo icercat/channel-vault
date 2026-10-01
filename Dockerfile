@@ -7,6 +7,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg ca-certi
     && /opt/bootstrap/bin/pip install --no-cache-dir 'yt-dlp[default]'
 WORKDIR /app
 COPY app.py /app/app.py
+COPY providers.py /app/providers.py
 COPY web /app/web
 EXPOSE 8080
 CMD ["python", "-u", "app.py"]

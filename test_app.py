@@ -12,13 +12,15 @@ import urllib.request
 import urllib.error
 from unittest.mock import patch
 import app
+import providers
 
 class VaultTests(unittest.TestCase):
     def setUp(self):
         self.tmp=tempfile.TemporaryDirectory()
         app.DATA=Path(self.tmp.name)/'data';app.MEDIA=Path(self.tmp.name)/'downloads'
-        app.STOP.clear();app.LIVE_PROBE_CACHE.clear();app.initialize()
+        app.COOKIES=Path(self.tmp.name)/'cookies';app.STOP.clear();app.LIVE_PROBE_CACHE.clear();app.initialize()
         self.cid=app.execute('INSERT INTO channels(url,name) VALUES(?,?)',('https://www.youtube.com/@test','測試'))
+        self.sid=app.execute('INSERT INTO sources(channel_id,platform,url) VALUES(?,?,?)',(self.cid,'youtube','https://www.youtube.com/@test'))
     def tearDown(self):
         self.tmp.cleanup()
     def test_subscription_normalization_and_rejection(self):
@@ -92,11 +94,73 @@ class VaultTests(unittest.TestCase):
     def test_settings_persist_and_validate(self):
         values={'theme':'neon-pink','accent':'#FF80DD','background':'','surface':''}
         app.save_settings(values)
-        self.assertEqual(app.settings(),values)
+        self.assertEqual({k:app.settings()[k] for k in values},values)
         app.initialize()
-        self.assertEqual(app.settings(),values)
+        self.assertEqual({k:app.settings()[k] for k in values},values)
         for value in [{'theme':'missing'},{'theme':'trans','accent':'url(javascript:bad)'}]:
             with self.assertRaises(ValueError):app.save_settings(value)
+    def test_runtime_settings_persist_and_reject_auth_or_invalid_counts(self):
+        values={'theme':'trans','runtime':{'LIVE_WORKERS':6,'SCAN_SECONDS':120,'YTDLP_CHANNEL':'nightly','LIVE_FROM_START':True}}
+        app.save_settings(values);app.initialize()
+        for name,value in values['runtime'].items():self.assertEqual(app.runtime_settings()[name],value)
+        for runtime in [{'WEB_PASSWORD':'bad'},{'BIND_IP':'0.0.0.0'},{'LIVE_WORKERS':0},{'LIVE_WORKERS':True},{'YTDLP_CHANNEL':'bad'}]:
+            with self.assertRaises(ValueError):app.save_settings({'theme':'trans','runtime':runtime})
+    def test_platform_normalization_and_multi_source(self):
+        self.assertEqual(providers.source_url('https://twitter.com/Example/media'),('twitter','https://x.com/example'))
+        self.assertEqual(providers.source_url('https://www.twitch.tv/Example/videos'),('twitch','https://www.twitch.tv/example'))
+        for url in ['https://www.twitch.tv/videos/123','https://x.com/user/status/123','https://evil.test/creator']:
+            with self.assertRaises(ValueError):providers.source_url(url)
+        twitch=app.execute('INSERT INTO sources(channel_id,platform,url) VALUES(?,?,?)',(self.cid,'twitch','https://www.twitch.tv/tester'))
+        app.enqueue(self.cid,'https://youtube.com/watch?v=a','a','YT',source_id=self.sid)
+        app.enqueue(self.cid,'https://twitch.tv/videos/123','twitch:a','TW',source_id=twitch)
+        self.assertEqual(len(app.rows('SELECT * FROM jobs WHERE channel_id=?',(self.cid,))),2)
+        app.execute('UPDATE sources SET enabled=0 WHERE id=?',(twitch,))
+        self.assertEqual(app.claim(False)['title'],'YT');self.assertIsNone(app.claim(False))
+    def test_twitch_live_detection_and_archive_discovery(self):
+        sid=app.execute('INSERT INTO sources(channel_id,platform,url) VALUES(?,?,?)',(self.cid,'twitch','https://www.twitch.tv/tester'))
+        source=app.rows('SELECT * FROM sources WHERE id=?',(sid,))[0]
+        with patch.object(app,'probe',return_value={'is_live':True,'id':'stream123','timestamp':100,'title':'Live'}):
+            app.poll_source(source);app.poll_source(source)
+        self.assertEqual(len(app.rows('SELECT * FROM jobs WHERE live=1')),1)
+        with patch.object(app,'probe',return_value={'entries':[{'id':'v123','url':'https://www.twitch.tv/videos/123','title':'Replay'}]}):app.scan_source(source)
+        self.assertEqual(len(app.rows('SELECT * FROM jobs')),2)
+        self.assertEqual(app.rows("SELECT kind FROM jobs WHERE media_key='twitch:v123'")[0]['kind'],'live')
+    def test_twitter_api_pagination_filters_video_posts(self):
+        responses=[{'data':{'id':'42'}},{'data':[{'id':'100','text':'Movie','attachments':{'media_keys':['m1']}},{'id':'99','text':'Photo','attachments':{'media_keys':['m2']}}],'includes':{'media':[{'media_key':'m1','type':'video'},{'media_key':'m2','type':'photo'}]},'meta':{'newest_id':'100','next_token':'next'}},{'data':[{'id':'90','text':'GIF','attachments':{'media_keys':['m3']}}],'includes':{'media':[{'media_key':'m3','type':'animated_gif'}]},'meta':{'newest_id':'90'}}]
+        with patch.object(providers,'x_request',side_effect=responses):
+            batches=list(providers.x_posts('tester','fake-token',history=True))
+        self.assertEqual([p['id'] for b in batches for p in b['entries']],['100','90'])
+        with self.assertRaises(RuntimeError):list(providers.x_posts('tester',''))
+    def test_twitter_discovered_posts_join_same_library(self):
+        sid=app.execute('INSERT INTO sources(channel_id,platform,url) VALUES(?,?,?)',(self.cid,'twitter','https://x.com/tester'))
+        source=app.rows('SELECT * FROM sources WHERE id=?',(sid,))[0]
+        batch={'user_id':'42','newest_id':'100','entries':[{'id':'100','url':'https://x.com/tester/status/100','title':'X movie'}]}
+        with patch.object(app,'x_posts',return_value=[batch]):app.scan_twitter(source)
+        job=app.rows('SELECT * FROM jobs')[0]
+        self.assertEqual(job['channel_id'],self.cid);self.assertEqual(job['source_id'],sid)
+    def test_cookie_write_only_and_per_platform_snapshots(self):
+        content='# Netscape HTTP Cookie File\n.youtube.com\tTRUE\t/\tTRUE\t2000000000\tSID\tTEST_SECRET_VALUE\n'
+        result=app.save_secret({'platform':'youtube','content':content})
+        self.assertTrue(result['cookies']['youtube']['configured'])
+        self.assertNotIn('TEST_SECRET_VALUE',json.dumps(app.settings()))
+        args=app.base_args('https://youtube.com/watch?v=a')
+        snapshot=Path(args[args.index('--cookies')+1]);self.assertEqual(snapshot.read_text(),content)
+        self.assertNotEqual(snapshot,app.COOKIES/'youtube.txt')
+        app.cleanup_cookie_args(args);self.assertFalse(snapshot.exists())
+        self.assertNotIn('--cookies',app.base_args('https://twitch.tv/tester'))
+        app.save_secret({'platform':'youtube','enabled':False})
+        self.assertNotIn('--cookies',app.base_args('https://youtube.com/watch?v=a'))
+        with self.assertRaises(ValueError):app.save_secret({'platform':'youtube','content':'not cookies'})
+        app.save_secret({'platform':'youtube','delete':True})
+        self.assertFalse((app.COOKIES/'youtube.txt').exists())
+    def test_image_history_preserves_choice_and_deduplicates(self):
+        first=app.store_image(self.cid,'avatar',b'first','image/png')
+        second=app.store_image(self.cid,'avatar',b'second','image/png')
+        self.assertEqual(app.rows('SELECT active_avatar FROM channels')[0]['active_avatar'],first)
+        self.assertEqual(app.store_image(self.cid,'avatar',b'second','image/png',activate=True),second)
+        self.assertEqual(len(app.rows('SELECT * FROM images')),2)
+        self.assertEqual(app.rows('SELECT active_avatar FROM channels')[0]['active_avatar'],second)
+        for image in app.rows('SELECT * FROM images'):self.assertTrue((app.DATA/'assets'/image['path']).is_file())
     def test_channel_images_cached_from_extractor_metadata(self):
         class Response:
             url='https://yt3.ggpht.com/test'
@@ -108,7 +172,7 @@ class VaultTests(unittest.TestCase):
             def __exit__(self,*args):pass
         metadata={'description':'Channel bio','thumbnails':[{'id':'avatar_uncropped','url':'https://yt3.ggpht.com/avatar=s0'},{'id':'banner_uncropped','url':'https://yt3.ggpht.com/banner=s0'}]}
         with patch.object(app,'urlopen',return_value=Response()):app.cache_channel_images(self.cid,metadata)
-        self.assertTrue((app.DATA/'assets'/f'channel-{self.cid}-avatar.img').exists())
+        self.assertTrue(app.rows("SELECT id FROM images WHERE channel_id=? AND role='avatar'",(self.cid,)))
         c=app.rows('SELECT * FROM channels')[0]
         self.assertEqual(c['banner'],'image/jpeg');self.assertEqual(c['description'],'Channel bio')
         self.assertFalse(app.image_url_allowed('https://ggpht.com.evil.test/image'))
@@ -162,9 +226,28 @@ class VaultTests(unittest.TestCase):
                 code,data=request('/api/jobs?single=1',headers=headers)
                 self.assertEqual(len(json.loads(data)),1)
                 self.assertEqual(request('/',headers=headers)[0],200)
+                group=json.loads(request('/api/channels',{'url':'https://www.youtube.com/@second','name':'One creator'},headers)[1])['id']
+                source=json.loads(request(f'/api/channels/{group}/sources',{'url':'https://twitch.tv/second'},headers)[1])['id']
+                groups=json.loads(request('/api/channels',headers=headers)[1])
+                joined=next(c for c in groups if c['id']==group)
+                self.assertEqual({s['platform'] for s in joined['sources']},{'youtube','twitch'})
+                self.assertEqual(joined['name'],'One creator')
+                request('/api/download',{'url':'https://twitch.tv/videos/123','channel_id':group},headers)
+                joined_jobs=json.loads(request(f'/api/jobs?channel={group}',headers=headers)[1])
+                self.assertEqual(joined_jobs[0]['source_platform'],'twitch')
+                request(f'/api/sources/{source}/toggle',{},headers)
+                first=app.store_image(group,'avatar',b'old image','image/png')
+                second=app.store_image(group,'avatar',b'new image','image/png')
+                gallery=json.loads(request(f'/api/channels/{group}/images',headers=headers)[1])
+                self.assertEqual(len(gallery),2)
+                request(f'/api/channels/{group}/images/select',{'id':second},headers)
+                self.assertEqual(app.rows('SELECT active_avatar FROM channels WHERE id=?',(group,))[0]['active_avatar'],second)
+                self.assertEqual(request(f'/asset/image/{first}',headers=headers)[1],b'old image')
+                with self.assertRaises(urllib.error.HTTPError) as e:request(f'/api/channels/{self.cid}/images/select',{'id':second},headers)
+                self.assertEqual(e.exception.code,400)
                 settings={'theme':'twitch','accent':'','background':'','surface':''}
-                self.assertEqual(json.loads(request('/api/settings',settings,headers)[1]),settings)
-                self.assertEqual(json.loads(request('/api/settings',headers=headers)[1]),settings)
+                self.assertEqual({k:json.loads(request('/api/settings',settings,headers)[1])[k] for k in settings},settings)
+                self.assertEqual({k:json.loads(request('/api/settings',headers=headers)[1])[k] for k in settings},settings)
                 media=app.MEDIA/'sample.mp4';media.write_bytes(b'0123456789')
                 job=app.rows('SELECT id FROM jobs')[0]['id'];app.register_file(job,media,'preview')
                 fileid=app.rows('SELECT id FROM files')[0]['id']

@@ -1,0 +1,10 @@
+.env
+.env.*
+!.env.example
+/data/
+/downloads/
+/cookies/
+__pycache__/
+*.py[cod]
+*.zip
+*.log
