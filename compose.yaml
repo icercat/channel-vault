@@ -15,6 +15,9 @@ services:
       UPDATE_SECONDS: ${UPDATE_SECONDS:-86400}
       DOWNLOAD_WORKERS: ${DOWNLOAD_WORKERS:-2}
       LIVE_WORKERS: ${LIVE_WORKERS:-4}
+      TRANSCODE_WORKERS: ${TRANSCODE_WORKERS:-1}
+      TRANSCODE_THREADS: ${TRANSCODE_THREADS:-2}
+      PLAYBACK_HEIGHT: ${PLAYBACK_HEIGHT:-1080}
       YTDLP_CHANNEL: ${YTDLP_CHANNEL:-stable}
       LIVE_FROM_START: ${LIVE_FROM_START:-false}
       WEB_USER: ${WEB_USER:-admin}
@@ -24,6 +27,10 @@ services:
       - ./downloads:/downloads
       - ./cookies:/cookies
     stop_grace_period: 60s
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/health',timeout=5)"]
       interval: 30s
