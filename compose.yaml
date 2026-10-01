@@ -1,0 +1,37 @@
+services:
+  channel-vault:
+    build: .
+    container_name: channel-vault
+    init: true
+    restart: unless-stopped
+    ports:
+      - "${BIND_IP:-0.0.0.0}:${WEB_PORT:-8088}:8080"
+    environment:
+      TZ: Asia/Taipei
+      DATA_DIR: /data
+      DOWNLOAD_DIR: /downloads
+      LIVE_POLL_SECONDS: ${LIVE_POLL_SECONDS:-30}
+      SCAN_SECONDS: ${SCAN_SECONDS:-21600}
+      UPDATE_SECONDS: ${UPDATE_SECONDS:-86400}
+      DOWNLOAD_WORKERS: ${DOWNLOAD_WORKERS:-2}
+      LIVE_WORKERS: ${LIVE_WORKERS:-4}
+      YTDLP_CHANNEL: ${YTDLP_CHANNEL:-stable}
+      LIVE_FROM_START: ${LIVE_FROM_START:-false}
+      WEB_USER: ${WEB_USER:-admin}
+      WEB_PASSWORD: ${WEB_PASSWORD:?Set WEB_PASSWORD in .env first}
+    volumes:
+      - ./data:/data
+      - ./downloads:/downloads
+      - ./cookies:/cookies
+    stop_grace_period: 60s
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/health',timeout=5)"]
+      interval: 30s
+      timeout: 10s
+      start_period: 120s
+      retries: 3
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
