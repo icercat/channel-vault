@@ -21,6 +21,22 @@ class VaultTests(unittest.TestCase):
         app.COOKIES=Path(self.tmp.name)/'cookies';app.STOP.clear();app.LIVE_PROBE_CACHE.clear();app.initialize()
         self.cid=app.execute('INSERT INTO channels(url,name) VALUES(?,?)',('https://www.youtube.com/@test','測試'))
         self.sid=app.execute('INSERT INTO sources(channel_id,platform,url) VALUES(?,?,?)',(self.cid,'youtube','https://www.youtube.com/@test'))
+    def test_v4_gallery_filter(self):
+        m=[[3,'https://video.twimg.com/a.mp4',{'tweet_id':103,'extension':'mp4'}],[3,'https://video.twimg.com/b.mp4',{'tweet_id':103,'extension':'mp4'}],[3,'https://pbs.twimg.com/a.jpg',{'tweet_id':104,'extension':'jpg'}]]
+        self.assertEqual([e['id'] for e in providers.gallery_entries(m,'test','100')],['103'])
+    def test_v4_free_mode_no_paid_calls(self):
+        sid=app.execute('INSERT INTO sources(channel_id,platform,url) VALUES(?,?,?)',(self.cid,'twitter','https://x.com/test'))
+        source=app.rows('SELECT * FROM sources WHERE id=?',(sid,))[0]
+        app.COOKIES.mkdir(exist_ok=True);(app.COOKIES/'twitter.txt').write_text('# Netscape HTTP Cookie File\n')
+        output=json.dumps([[3,'https://video.twimg.com/a.mp4',{'tweet_id':103,'extension':'mp4'}]])
+        with patch.dict(app.RUNTIME,{'X_DISCOVERY_MODE':'cookies'}), patch.object(app.subprocess,'run',return_value=subprocess.CompletedProcess([],0,output,'')) as run, patch.object(app,'x_posts') as paid:
+            app.scan_twitter(source);paid.assert_not_called();self.assertIn('--post-range',run.call_args.args[0])
+        self.assertEqual(app.rows('SELECT media_key FROM jobs')[0]['media_key'],'twitter:103')
+        self.assertEqual(list((app.DATA/'cookie-runs').iterdir()),[])
+    def test_v4_mode_validation(self):
+        with self.assertRaises(ValueError):app.save_settings({'theme':'trans','runtime':{'X_DISCOVERY_MODE':'invalid'}})
+        with patch.dict(app.RUNTIME,{'X_DISCOVERY_MODE':'cookies'}):
+            with self.assertRaises(RuntimeError):app.scan_twitter_cookies({'url':'https://x.com/test'})
     def tearDown(self):
         self.tmp.cleanup()
     def test_subscription_normalization_and_rejection(self):
@@ -135,7 +151,7 @@ class VaultTests(unittest.TestCase):
         sid=app.execute('INSERT INTO sources(channel_id,platform,url) VALUES(?,?,?)',(self.cid,'twitter','https://x.com/tester'))
         source=app.rows('SELECT * FROM sources WHERE id=?',(sid,))[0]
         batch={'user_id':'42','newest_id':'100','entries':[{'id':'100','url':'https://x.com/tester/status/100','title':'X movie'}]}
-        with patch.object(app,'x_posts',return_value=[batch]):app.scan_twitter(source)
+        with patch.dict(app.RUNTIME,{'X_DISCOVERY_MODE':'api'}), patch.object(app,'x_posts',return_value=[batch]):app.scan_twitter(source)
         job=app.rows('SELECT * FROM jobs')[0]
         self.assertEqual(job['channel_id'],self.cid);self.assertEqual(job['source_id'],sid)
     def test_cookie_write_only_and_per_platform_snapshots(self):

@@ -191,3 +191,11 @@ node --check web/app.js
 每次完成修改後會提供與當前實作一致的完成頁面預覽。預覽使用示範資料，與真實來源的端到端實測分開標示。此偏好已寫入 AGENTS.md。
 
 Git 不追蹤空目錄，ZIP 發行檔另外寫入空的 data/、downloads/、cookies/；版本控制不包含任何資料庫、cookies、token、.env 或下載媒體。
+
+
+## V4：免費 X 追蹤與選用 Token
+預設 `X_DISCOVERY_MODE=cookies`，在設定頁上傳並啟用 Netscape 格式的 Twitter / X 登入 cookies，gallery-dl 掃描 `/media` 後將影片貼文交给 yt-dlp。保留多來源訂閱、原檔、MP3 與播放副本。設定頁可以明確選擇 `api` 使用已保存的官方 Bearer Token；不會自動退回付費 API。既有 Token 保留但預設不使用。既有任務使用相同 twitter media key 去重。
+
+歷史掃描最多執行 30 分鐘，定期輪詢最近 100 則媒體貼文最多 5 分鐘，超出範圍可能漏抓，請使用重新掃描補查。免費模式僅探索帳號 media 影片/GIF，不保證 X 直播即時發現或完整歷史。cookies 過期、限流與網站改版可能使掃描失效。gallery-dl 與 yt-dlp 一起自動更新。切換模式會重新掃描；已有下載保留。訂閱或來源暫停時不下載佇列。
+
+Docker 對外固定 8088、容器內 8080。升級時保留 data/downloads/cookies 與 .env，重建映像（只重啟不會更新程式）：`docker compose up -d --build`。

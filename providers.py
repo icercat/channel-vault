@@ -72,3 +72,21 @@ def x_posts(username,token,user_id=None,since_id=None,history=False):
         if not history or not cursor:break
         if cursor in seen:raise RuntimeError('X API 分頁 cursor 重複')
         seen.add(cursor);params['pagination_token']=cursor
+
+
+def gallery_entries(messages, username, since_id=None):
+    """Normalize gallery-dl URL messages into one job per video post."""
+    seen=set()
+    for message in messages:
+        if not isinstance(message,list) or len(message)<3 or message[0]!=3:
+            continue
+        url,meta=message[1:3]
+        if not isinstance(meta,dict):continue
+        ident=str(meta.get('tweet_id') or '')
+        if not ident.isdigit() or ident in seen:continue
+        if since_id and int(ident)<=int(since_id):continue
+        if meta.get('extension') not in ('mp4','webm','m3u8') and not ('video.twimg.com/' in url):continue
+        seen.add(ident)
+        yield {'id':ident,'url':f'https://x.com/{username}/status/{ident}',
+               'title':meta.get('content') or meta.get('description') or 'X 影片',
+               'thumbnail':meta.get('thumbnail')}

@@ -4,7 +4,7 @@ COPY --from=deno /deno /usr/local/bin/deno
 RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg ca-certificates \
     && rm -rf /var/lib/apt/lists/* \
     && python -m venv /opt/bootstrap \
-    && /opt/bootstrap/bin/pip install --no-cache-dir 'yt-dlp[default]'
+    && /opt/bootstrap/bin/pip install --no-cache-dir 'yt-dlp[default]' gallery-dl
 WORKDIR /app
 COPY app.py /app/app.py
 COPY providers.py /app/providers.py

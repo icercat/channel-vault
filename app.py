@@ -48,6 +48,7 @@ RUNTIME_SCHEMA = {
 
 def runtime_settings():
     value={name:env_int(name,bounds[0]) for name,bounds in RUNTIME_SCHEMA.items()}
+    value['X_DISCOVERY_MODE']=env_value('X_DISCOVERY_MODE','cookies')
     value['YTDLP_CHANNEL']=env_value('YTDLP_CHANNEL','stable')
     value['LIVE_FROM_START']=str(env_value('LIVE_FROM_START','false')).lower()=='true'
     return value
@@ -175,6 +176,8 @@ def save_settings(values):
                 _,low,high=RUNTIME_SCHEMA[name]
                 if isinstance(value,bool) or not isinstance(value,int) or not low<=value<=high:
                     raise ValueError(f'{name} 必須介於 {low} 與 {high}')
+            elif name=='X_DISCOVERY_MODE':
+                if value not in ('cookies','api'):raise ValueError('X 追蹤方式必須是 cookies 或 api')
             elif name=='YTDLP_CHANNEL':
                 if value not in ('stable','nightly'):raise ValueError('更新來源必須是 stable 或 nightly')
             elif name=='LIVE_FROM_START':
@@ -183,7 +186,7 @@ def save_settings(values):
             validated[name]=value
         for name,value in validated.items():
             con.execute('INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value',('runtime:'+name,json.dumps(value)))
-        if 'SCAN_SECONDS' in validated and validated['SCAN_SECONDS']!=previous_runtime['SCAN_SECONDS']:
+        if any(k in validated and validated[k]!=previous_runtime.get(k) for k in ('SCAN_SECONDS','X_DISCOVERY_MODE')):
             con.execute('UPDATE sources SET scan_due=0')
     RUNTIME.update(validated)
     if any(previous_runtime.get(k)!=v for k,v in validated.items()):CONFIG_GENERATION+=1
@@ -466,7 +469,37 @@ def scan_source(s):
     execute('UPDATE channels SET last_scan=? WHERE id=?',(time.time(),c['id']))
     if error:log(f"來源掃描 {s['url']}：{error}",level='ERROR')
 
+def scan_twitter_cookies(s,history=False):
+    args=base_args(s['url'])
+    if '--cookies' not in args:
+        raise RuntimeError('免費 X 追蹤需要上傳並啟用 Twitter / X 登入 cookies')
+    cookie=args[args.index('--cookies')+1]
+    command=[ytdlp()[0],'-m','gallery_dl','--config-ignore','--no-input',
+             '--no-colors','--dump-json','--cookies',cookie,'--retries','2',
+             '--http-timeout','20','--sleep-request','2',
+             '-o','extractor.twitter.retweets=false',
+             '-o','extractor.twitter.videos=true']
+    if not history:command+=['--post-range','1:100']
+    try:
+        result=subprocess.run(command+[s['url']+'/media'],capture_output=True,text=True,timeout=1800 if history else 300)
+        if result.returncode:
+            raise RuntimeError('gallery-dl 掃描失敗；請檢查登入 cookies 是否過期、X 限流及工具更新（code '+str(result.returncode)+'）')
+        messages=json.loads(result.stdout)
+        from providers import gallery_entries
+        entries=gallery_entries(messages,s['url'].rsplit('/',1)[1],None if history else s.get('last_post_id'))
+        newest=s.get('last_post_id');count=0
+        for e in entries:
+            if STOP.is_set():return
+            ident=enqueue(s['channel_id'],e['url'],'twitter:'+e['id'],e['title'],'video',False,s['id'])
+            update_job_metadata(ident,e);count+=1
+            if not newest or int(e['id'])>int(newest):newest=e['id']
+        execute('UPDATE sources SET last_post_id=? WHERE id=?',(newest,s['id']))
+        log(f"X cookies 掃描 {s['url']}：找到 {count} 個影片貼文")
+    finally:cleanup_cookie_args(args)
+
 def scan_twitter(s,history=False):
+    if env_value('X_DISCOVERY_MODE','cookies')=='cookies':
+        return scan_twitter_cookies(s,history)
     path=COOKIES/'x-bearer.txt'
     token=path.read_text().strip() if path.is_file() else ''
     newest=s.get('last_post_id')
@@ -735,7 +768,7 @@ def update_runtime():
         log('檢查並更新 yt-dlp…')
         dest.parent.mkdir(exist_ok=True)
         subprocess.run([sys.executable,'-m','venv',str(dest)],check=True,timeout=120,capture_output=True)
-        args = [str(dest/'bin/python'),'-m','pip','install','--no-cache-dir','--upgrade','yt-dlp[default]']
+        args = [str(dest/'bin/python'),'-m','pip','install','--no-cache-dir','--upgrade','gallery-dl','yt-dlp[default]']
         if env_value('YTDLP_CHANNEL','stable')=='nightly':
             args.insert(-1,'--pre')
         result = subprocess.run(args,capture_output=True,text=True,timeout=600)
@@ -743,7 +776,7 @@ def update_runtime():
             raise RuntimeError(result.stderr[-2000:])
         version = subprocess.check_output([str(dest/'bin/python'),'-m','yt_dlp','--version'],text=True,timeout=20).strip()
         old = subprocess.check_output(ytdlp()+['--version'],text=True,timeout=20).strip()
-        if version == old:
+        if version == old and subprocess.run([ytdlp()[0],'-m','gallery_dl','--version'],capture_output=True).returncode==0 and subprocess.check_output([str(dest/'bin/python'),'-m','gallery_dl','--version'],text=True).strip()==subprocess.check_output([ytdlp()[0],'-m','gallery_dl','--version'],text=True).strip():
             import shutil
             shutil.rmtree(dest)
             log(f'yt-dlp {version} 已是最新版本')
