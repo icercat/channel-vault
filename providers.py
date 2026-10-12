@@ -49,7 +49,7 @@ def x_posts(username,token,user_id=None,since_id=None,history=False):
         response=x_request('users/by/username/'+username,token)
         user_id=response.get('data',{}).get('id')
     if not user_id:raise RuntimeError('X API 找不到此帳號')
-    params={'max_results':100,'tweet.fields':'attachments,created_at,entities','expansions':'attachments.media_keys','media.fields':'type,preview_image_url'}
+    params={'max_results':100,'tweet.fields':'attachments,created_at,entities','expansions':'attachments.media_keys','media.fields':'type,preview_image_url,url'}
     if since_id:params['since_id']=since_id
     seen=set()
     while True:
@@ -58,8 +58,10 @@ def x_posts(username,token,user_id=None,since_id=None,history=False):
             raise RuntimeError('X API 未回傳貼文，請檢查 API 存取權限')
         media={m['media_key']:m for m in result.get('includes',{}).get('media',[])}
         posts=[]
+        saved_posts=[]
         for tweet in result.get('data') or []:
             attached=[media.get(k,{}) for k in tweet.get('attachments',{}).get('media_keys',[])]
+            saved_posts.append({'id':tweet['id'],'author':username,'text':tweet.get('text',''),'date':tweet.get('created_at',''),'url':f"https://x.com/{username}/status/{tweet['id']}",'images':[m['url'] for m in attached if m.get('type')=='photo' and m.get('url')]})
             if any(m.get('type') in ('video','animated_gif') for m in attached):
                 posts.append({'id':tweet['id'],'url':f"https://x.com/{username}/status/{tweet['id']}",'title':tweet.get('text','X 影片'),'thumbnail':next((m.get('preview_image_url') for m in attached if m.get('preview_image_url')),None)})
             for link in tweet.get('entities',{}).get('urls',[]):
@@ -67,7 +69,7 @@ def x_posts(username,token,user_id=None,since_id=None,history=False):
                 if re.fullmatch(r'https://(?:www\.)?(?:x|twitter)\.com/i/broadcasts/[\w]+',url):
                     posts.append({'id':url.rsplit('/',1)[1],'url':url,'title':tweet.get('text','X 直播'),'broadcast':True})
         newest=result.get('meta',{}).get('newest_id')
-        yield {'user_id':user_id,'newest_id':newest,'entries':posts}
+        yield {'user_id':user_id,'newest_id':newest,'entries':posts,'posts':saved_posts}
         cursor=result.get('meta',{}).get('next_token')
         if not history or not cursor:break
         if cursor in seen:raise RuntimeError('X API 分頁 cursor 重複')
@@ -90,3 +92,18 @@ def gallery_entries(messages, username, since_id=None):
         yield {'id':ident,'url':f'https://x.com/{username}/status/{ident}',
                'title':meta.get('content') or meta.get('description') or 'X 影片',
                'thumbnail':meta.get('thumbnail')}
+
+
+def gallery_posts(messages, username):
+    posts={}
+    for message in messages:
+        if not isinstance(message,list) or not message:continue
+        meta=message[-1] if message[0] in (2,3) and len(message)>1 else None
+        if not isinstance(meta,dict):continue
+        ident=str(meta.get('tweet_id') or '')
+        if not ident.isdigit():continue
+        author=meta.get('author') or {}
+        post=posts.setdefault(ident,{'id':ident,'author':author.get('name',username) if isinstance(author,dict) else username,'text':meta.get('content') or meta.get('description') or '', 'date':str(meta.get('date') or ''),'url':f'https://x.com/{username}/status/{ident}','images':[]})
+        if message[0]==3 and meta.get('extension') in ('jpg','jpeg','png','webp') and isinstance(message[1],str):
+            if message[1] not in post['images']:post['images'].append(message[1])
+    return list(posts.values())

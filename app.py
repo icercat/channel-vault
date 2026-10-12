@@ -48,6 +48,7 @@ RUNTIME_SCHEMA = {
 
 def runtime_settings():
     value={name:env_int(name,bounds[0]) for name,bounds in RUNTIME_SCHEMA.items()}
+    value['X_SAVE_POSTS']=str(env_value('X_SAVE_POSTS','true')).lower()=='true'
     value['X_DISCOVERY_MODE']=env_value('X_DISCOVERY_MODE','cookies')
     value['YTDLP_CHANNEL']=env_value('YTDLP_CHANNEL','stable')
     value['LIVE_FROM_START']=str(env_value('LIVE_FROM_START','false')).lower()=='true'
@@ -109,6 +110,10 @@ def initialize():
           id INTEGER PRIMARY KEY,channel_id INTEGER NOT NULL,platform TEXT NOT NULL,
           url TEXT NOT NULL UNIQUE,enabled INTEGER DEFAULT 1,scan_due REAL DEFAULT 0,
           last_scan REAL,last_live REAL,error TEXT,provider_user_id TEXT,last_post_id TEXT);
+        CREATE TABLE IF NOT EXISTS posts (
+          id INTEGER PRIMARY KEY,channel_id INTEGER NOT NULL,source_id INTEGER NOT NULL,
+          post_id TEXT NOT NULL,author TEXT,text TEXT,posted TEXT,url TEXT,images TEXT,
+          saved REAL NOT NULL,UNIQUE(source_id,post_id));
         CREATE TABLE IF NOT EXISTS images (
           id INTEGER PRIMARY KEY,channel_id INTEGER NOT NULL,source_id INTEGER,
           role TEXT NOT NULL,path TEXT NOT NULL,mime TEXT NOT NULL,
@@ -180,13 +185,13 @@ def save_settings(values):
                 if value not in ('cookies','api'):raise ValueError('X 追蹤方式必須是 cookies 或 api')
             elif name=='YTDLP_CHANNEL':
                 if value not in ('stable','nightly'):raise ValueError('更新來源必須是 stable 或 nightly')
-            elif name=='LIVE_FROM_START':
+            elif name in ('LIVE_FROM_START','X_SAVE_POSTS'):
                 if not isinstance(value,bool):raise ValueError('LIVE_FROM_START 必須是布林值')
             else:raise ValueError(f'不允許修改 {name}')
             validated[name]=value
         for name,value in validated.items():
             con.execute('INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value',('runtime:'+name,json.dumps(value)))
-        if any(k in validated and validated[k]!=previous_runtime.get(k) for k in ('SCAN_SECONDS','X_DISCOVERY_MODE')):
+        if any(k in validated and validated[k]!=previous_runtime.get(k) for k in ('SCAN_SECONDS','X_DISCOVERY_MODE','X_SAVE_POSTS')):
             con.execute('UPDATE sources SET scan_due=0')
     RUNTIME.update(validated)
     if any(previous_runtime.get(k)!=v for k,v in validated.items()):CONFIG_GENERATION+=1
@@ -469,6 +474,50 @@ def scan_source(s):
     execute('UPDATE channels SET last_scan=? WHERE id=?',(time.time(),c['id']))
     if error:log(f"來源掃描 {s['url']}：{error}",level='ERROR')
 
+def save_post(source,post):
+    """Keep the first captured post snapshot and retry missing local photos."""
+    ident=str(post['id'])
+    if not ident.isdigit():raise ValueError('無效貼文 ID')
+    folder=MEDIA/f"channel-{source['channel_id']}"/'貼文'/str(source['id'])/ident
+    folder.mkdir(parents=True,exist_ok=True)
+    old=rows('SELECT * FROM posts WHERE source_id=? AND post_id=?',(source['id'],ident))
+    if old:
+        snapshot=json.loads((folder/'post.json').read_text())
+    else:
+        snapshot={k:post.get(k,'') for k in ('id','author','text','date','url')}
+        snapshot['images']=post.get('images') or [];snapshot['saved']=time.time()
+        (folder/'post.json').write_text(json.dumps(snapshot,ensure_ascii=False,indent=2))
+        (folder/'post.txt').write_text(f"{snapshot['author']}\n{snapshot['date']}\n{snapshot['url']}\n\n{snapshot['text']}\n")
+        execute('INSERT OR IGNORE INTO posts(channel_id,source_id,post_id,author,text,posted,url,images,saved) VALUES(?,?,?,?,?,?,?,?,?)',
+                (source['channel_id'],source['id'],ident,snapshot['author'],snapshot['text'],snapshot['date'],snapshot['url'],json.dumps(snapshot['images']),snapshot['saved']))
+    from urllib.request import build_opener,HTTPRedirectHandler
+    class NoRedirect(HTTPRedirectHandler):
+        def redirect_request(self,*args):return None
+    for index,url in enumerate(snapshot['images']):
+        target=folder/(str(index)+'.img')
+        if target.exists():continue
+        u=urlsplit(url)
+        if u.scheme!='https' or u.hostname!='pbs.twimg.com' or u.port not in (None,443) or u.username:continue
+        try:
+            with build_opener(NoRedirect).open(Request(url,headers={'User-Agent':'Mozilla/5.0'}),timeout=20) as response:
+                mime=response.headers.get('Content-Type','').split(';')[0]
+                if mime not in ('image/jpeg','image/png','image/webp'):raise ValueError('不支援的圖片類型')
+                data=response.read(20*1024*1024+1)
+                if len(data)>20*1024*1024:raise ValueError('圖片超過 20 MB')
+                temp=target.with_suffix('.tmp');temp.write_bytes(data);temp.replace(target)
+        except Exception:
+            log(f"貼文 {ident} 圖片 {index+1} 尚未保存，下一次掃描會重試",level='WARN')
+
+def post_folder(post):
+    return MEDIA/f"channel-{post['channel_id']}"/'貼文'/str(post['source_id'])/post['post_id']
+
+def list_posts(channel,offset=0):
+    posts=rows('SELECT * FROM posts WHERE channel_id=? ORDER BY length(post_id) DESC,post_id DESC LIMIT 100 OFFSET ?',(channel,max(0,offset)))
+    for p in posts:
+        urls=json.loads(p['images']);folder=post_folder(p)
+        p['images']=[{'index':i,'saved':(folder/(str(i)+'.img')).is_file()} for i in range(len(urls))]
+    return posts
+
 def scan_twitter_cookies(s,history=False):
     args=base_args(s['url'])
     if '--cookies' not in args:
@@ -479,13 +528,17 @@ def scan_twitter_cookies(s,history=False):
              '--http-timeout','20','--sleep-request','2',
              '-o','extractor.twitter.retweets=false',
              '-o','extractor.twitter.videos=true']
+    save_posts=runtime_settings()['X_SAVE_POSTS']
+    if save_posts:command+=['-o','extractor.twitter.text-tweets=true','-o','extractor.twitter.timeline.strategy=tweets']
     if not history:command+=['--post-range','1:100']
     try:
-        result=subprocess.run(command+[s['url']+'/media'],capture_output=True,text=True,timeout=1800 if history else 300)
+        result=subprocess.run(command+[s['url']+('/timeline' if save_posts else '/media')],capture_output=True,text=True,timeout=1800 if history else 300)
         if result.returncode:
             raise RuntimeError('gallery-dl 掃描失敗；請檢查登入 cookies 是否過期、X 限流及工具更新（code '+str(result.returncode)+'）')
         messages=json.loads(result.stdout)
-        from providers import gallery_entries
+        from providers import gallery_entries,gallery_posts
+        if save_posts:
+            for post in gallery_posts(messages,s['url'].rsplit('/',1)[1]):save_post(s,post)
         entries=gallery_entries(messages,s['url'].rsplit('/',1)[1],None if history else s.get('last_post_id'))
         newest=s.get('last_post_id');count=0
         for e in entries:
@@ -505,6 +558,8 @@ def scan_twitter(s,history=False):
     newest=s.get('last_post_id')
     for batch in x_posts(s['url'].rsplit('/',1)[1],token,s.get('provider_user_id'),None if history else newest,history):
         if STOP.is_set():return
+        if runtime_settings()['X_SAVE_POSTS']:
+            for post in batch.get('posts',[]):save_post(s,post)
         for e in batch['entries']:
             ident=enqueue(s['channel_id'],e['url'],'twitter:'+e['id'],e['title'],'live' if e.get('broadcast') else 'video',bool(e.get('broadcast') and not history),s['id'])
             update_job_metadata(ident,e)
@@ -885,6 +940,20 @@ class Handler(BaseHTTPRequestHandler):
             match=re.fullmatch(r'/api/channels/(\d+)/images',u.path)
             if match:
                 return self.respond(rows('SELECT id,source_id,role,mime,created FROM images WHERE channel_id=? ORDER BY id DESC',(int(match[1]),)))
+            if u.path=='/api/posts':
+                return self.respond(list_posts(int(q.get('channel',['0'])[0]),int(q.get('offset',['0'])[0])))
+            match=re.fullmatch(r'/post/(\d+)/(json|txt|image/\d+)',u.path)
+            if match:
+                found=rows('SELECT * FROM posts WHERE id=?',(int(match[1]),))
+                if not found:return self.respond({'error':'找不到貼文'},404)
+                folder=post_folder(found[0]);role=match[2]
+                path=folder/(role.split('/')[1]+'.img' if role.startswith('image/') else 'post.'+role)
+                if not path.is_file():return self.respond({'error':'附件尚未保存'},404)
+                mime='application/json' if role=='json' else 'text/plain; charset=utf-8' if role=='txt' else 'image/jpeg'
+                if role.startswith('image/'):
+                    head=path.read_bytes()[:12]
+                    mime='image/png' if head.startswith(b'\x89PNG') else 'image/webp' if head.startswith(b'RIFF') else 'image/jpeg'
+                return self.send_file(path,mime,attachment=not role.startswith('image/') or q.get('download')==['1'])
             if u.path=='/api/jobs':
                 where='1=1'; args=[]
                 if q.get('channel'):

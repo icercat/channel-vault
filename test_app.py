@@ -37,6 +37,39 @@ class VaultTests(unittest.TestCase):
         with self.assertRaises(ValueError):app.save_settings({'theme':'trans','runtime':{'X_DISCOVERY_MODE':'invalid'}})
         with patch.dict(app.RUNTIME,{'X_DISCOVERY_MODE':'cookies'}):
             with self.assertRaises(RuntimeError):app.scan_twitter_cookies({'url':'https://x.com/test'})
+    def test_posts_directory_text_and_multiple_photos(self):
+        meta={'tweet_id':123,'author':{'name':'tester'},'content':'hello <script>','date':'2026-10-12 10:00:00'}
+        messages=[[2,'',meta],[3,'https://pbs.twimg.com/a.jpg',{**meta,'extension':'jpg'}],[3,'https://pbs.twimg.com/b.jpg',{**meta,'extension':'jpg'}],[2,'',{'tweet_id':124,'content':'純文字'}]]
+        posts=providers.gallery_posts(messages,'tester')
+        self.assertEqual(len(posts),2);self.assertEqual(len(posts[0]['images']),2)
+        self.assertEqual(posts[1]['text'],'純文字')
+    def test_post_snapshot_dedup_and_local_exports(self):
+        source={'id':self.sid,'channel_id':self.cid}
+        post={'id':'123','author':'tester','text':'第一版文字','date':'2026-10-12','url':'https://x.com/tester/status/123','images':[]}
+        app.save_post(source,post);app.save_post(source,{**post,'text':'改版文字'})
+        self.assertEqual(len(app.list_posts(self.cid)),1)
+        saved=app.list_posts(self.cid)[0]
+        self.assertEqual(saved['text'],'第一版文字')
+        self.assertIn('第一版文字',(app.post_folder(saved)/'post.txt').read_text())
+        app.initialize();self.assertEqual(len(app.list_posts(self.cid)),1)
+    def test_api_archives_text_only_posts(self):
+        responses=[{'data':{'id':'42'}},{'data':[{'id':'999','text':'純文字','created_at':'2026-10-12T00:00:00Z'}],'meta':{'newest_id':'999'}}]
+        with patch.object(providers,'x_request',side_effect=responses):
+            batch=list(providers.x_posts('tester','fake'))[0]
+        self.assertEqual(batch['entries'],[]);self.assertEqual(batch['posts'][0]['text'],'純文字')
+    def test_post_photo_cache_and_host_guard(self):
+        source={'id':self.sid,'channel_id':self.cid}
+        post={'id':'125','author':'test','text':'photo','date':'','url':'https://x.com/test/status/125','images':['https://pbs.twimg.com/a.jpg','http://127.0.0.1/private']}
+        class Response:
+            headers={'Content-Type':'image/jpeg'}
+            def __enter__(self):return self
+            def __exit__(self,*args):pass
+            def read(self,*args):return b'\xff\xd8test'
+        with patch('urllib.request.build_opener') as opener:
+            opener.return_value.open.return_value=Response()
+            app.save_post(source,post);self.assertEqual(opener.return_value.open.call_count,1)
+        images=app.list_posts(self.cid)[0]['images']
+        self.assertTrue(images[0]['saved']);self.assertFalse(images[1]['saved'])
     def tearDown(self):
         self.tmp.cleanup()
     def test_subscription_normalization_and_rejection(self):
@@ -238,6 +271,12 @@ class VaultTests(unittest.TestCase):
                 with self.assertRaises(urllib.error.HTTPError) as e:request('/api/channels')
                 self.assertEqual(e.exception.code,401)
                 headers={'Authorization':auth,'Content-Type':'application/json'}
+                app.save_post({'id':self.sid,'channel_id':self.cid},{'id':'126','author':'tester','text':'保存測試','date':'','url':'https://x.com/tester/status/126','images':[]})
+                status,body=request('/api/posts?channel='+str(self.cid),headers=headers)
+                post=json.loads(body)[0]
+                self.assertEqual(post['text'],'保存測試')
+                self.assertIn('保存測試',request('/post/'+str(post['id'])+'/txt',headers=headers)[1].decode())
+
                 self.assertEqual(request('/api/download',{'url':'https://x.com/u/status/123'},headers)[0],201)
                 code,data=request('/api/jobs?single=1',headers=headers)
                 self.assertEqual(len(json.loads(data)),1)
