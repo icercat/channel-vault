@@ -1,5 +1,7 @@
 services:
   channel-vault:
+    # 預設拉 GitHub Actions 建好的映像（docker compose pull）；沒有網路或要改程式時仍可 docker compose up -d --build 本機建置
+    image: ghcr.io/icercat/channel-vault:latest
     build: .
     container_name: channel-vault
     init: true
