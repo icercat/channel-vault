@@ -30,7 +30,7 @@ docker compose up -d --build
 ```
 
 開啟 `http://伺服器IP:8088`，本機則是 `http://localhost:8088`。
-登入帳號預設 `admin`，密碼為 `.env` 的 `WEB_PASSWORD`。瀏覽器會顯示 Basic Auth 登入視窗。
+登入帳號預設 `admin`，密碼為 `.env` 的 `WEB_PASSWORD`。自 V4.2 起改為網頁登入頁（配色跟隨你在瀏覽器選的主題），不再跳出瀏覽器的 Basic Auth 視窗。
 
 第一次 build 會安裝 FFmpeg、Deno 和最新 stable yt-dlp，需要連線 Docker Hub、Debian 套件來源及 PyPI。之後每次啟動及每 24 小時會重新檢查 yt-dlp。沒有更新或更新失敗時保留原版本；已有錄製不會被更新流程停止。
 
@@ -146,7 +146,7 @@ cookies/cookies.txt
 
 直播從偵測當下開始，可能漏掉前面的秒數。`LIVE_FROM_START=true` 使用 yt-dlp 的實驗功能，能否補回開頭受 DVR 和來源格式限制。直播結束後才合併影音，這不代表等結束才下載；可直接觀察 `downloads` 裡錄製中的檔案大小。
 
-Web UI 預設 HTTP，Basic Auth 在 HTTP 上沒有傳輸加密；供內網使用。若需要從外網使用，放在自己的 HTTPS reverse proxy / Cloudflare Tunnel 後方。
+Web UI 預設 HTTP，登入帳密與 session cookie 在 HTTP 上沒有傳輸加密；供內網使用。若需要從外網使用，放在自己的 HTTPS reverse proxy / Cloudflare Tunnel 後方。
 
 ## 從 v1 / v2 升級
 
@@ -203,3 +203,8 @@ Docker 對外固定 8088、容器內 8080。升級時保留 data/downloads/cooki
 ## V4.1：X 貼文保存
 設定頁可啟用「保存 X 貼文文字與圖片」（預設啟用）。每個訂閱增加 X 貼文分頁，保存作者帳號、文字、時間、原始連結、JSON、TXT 及圖片原始 bytes。存於 downloads/channel-ID/貼文/source-ID/post-ID；影片仍透過原本佇列下載。保存首次抓取的快照，不覆蓋已存文字，不自動刪除網站已刪貼文。圖片保存失敗會提示，下次該貼文被掃到時重試；不包含評論與完整對話串，也不保證完整歷史。
 免費模式改掃 timeline 並啟用 text-tweets；每次輪詢最近 100 則，歷史掃描 30 分鐘上限。官方 API 模式同樣保存讀到的貼文與圖片，API 使用額度仍由 X 計費。升級後按重新掃描補保存舊貼文。暫停訂閱會停止新掃描，既有貼文保留。
+
+## V4.2：網頁登入、版本號與刪除影音
+- **網頁登入頁**：`compose.yaml` 新增 `auth`（登入頁與簽章 cookie）與 `gateway`（nginx）兩個容器，對外仍是 8088；`channel-vault` 本體不再直接開放埠，只能經 gateway 進入。帳密沿用 `.env` 的 `WEB_USER` / `WEB_PASSWORD`。登入後 gateway 會代入 app 內建的 Basic Auth，因此直接存取 app 仍需密碼。登入有效 `SESSION_HOURS`（預設 168）小時，同一 IP 連續輸入錯誤 8 次鎖 5 分鐘；位於 HTTPS 反向代理後請設定 `COOKIE_SECURE=true`。
+- **版本號**：標題旁顯示 `v4.2.0`，用來確認重建是否成功；`/api/status` 也會回傳 `app_version`。
+- **刪除單支影音**：已完成或失敗的項目可按「刪除」，需重新輸入登入密碼（連續錯誤 5 次鎖 5 分鐘）。會刪除該項目的原檔、MP3、播放副本、縮圖與該項目資料夾；排程中、下載中、錄製中、轉檔中的項目不能刪除。資料庫僅將項目標記為 `deleted`，頻道掃描不會重新下載。

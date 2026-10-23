@@ -1,4 +1,5 @@
 """Channel Vault: stdlib web API, persistent queues, isolated yt-dlp subprocesses."""
+APP_VERSION = '4.2.0'
 import base64
 import hmac
 import hashlib
@@ -7,6 +8,7 @@ import mimetypes
 import os
 from pathlib import Path
 import re
+import shutil
 import signal
 import sqlite3
 import subprocess
@@ -423,7 +425,7 @@ def _poll_youtube(c,source_id=None):
         if status in ('was_live','post_live','not_live'):
             continue
         old = rows('SELECT status,live FROM jobs WHERE channel_id=? AND media_key=?',(c['id'],e['id']))
-        if old and (old[0]['status']=='done' or old[0]['status'] in ('recording','downloading')):
+        if old and old[0]['status'] in ('done','deleted','recording','downloading'):
             continue
         if status != 'is_live':
             # Flat metadata may omit live_status; cache finished probes to avoid repeated requests.
@@ -851,6 +853,40 @@ def update_loop():
         update_runtime()
         wait_config(env_int('UPDATE_SECONDS',86400))
 
+DELETE_FAILS = {}  # ip -> (count, first_ts)
+
+def delete_job(jobid):
+    """Remove a finished/failed item's files and hide it. The row is kept as a tombstone
+    (status='deleted') so channel scans do not download the same media again."""
+    found = rows('SELECT status,derivative_status FROM jobs WHERE id=?',(jobid,))
+    if not found:
+        raise ValueError('找不到此影音')
+    if found[0]['status'] in ('queued','downloading','recording') or found[0]['derivative_status']=='processing':
+        raise ValueError('此項目正在排程、下載、錄製或轉檔中，請待完成或失敗後再刪除')
+    media = MEDIA.resolve()
+    removed = 0
+    for f in rows('SELECT path FROM files WHERE job_id=?',(jobid,)):
+        path = (media/f['path']).resolve()
+        if path.is_relative_to(media) and path != media:
+            path.unlink(missing_ok=True)
+            removed += 1
+            parent = path.parent
+            if parent.name == str(jobid) and parent != media and parent.is_relative_to(media):
+                shutil.rmtree(parent,ignore_errors=True)  # per-job folder also holds unregistered .info.json etc.
+            while parent != media and parent.is_relative_to(media):
+                if not parent.exists():
+                    parent = parent.parent
+                    continue
+                try:
+                    parent.rmdir()
+                except OSError:
+                    break
+                parent = parent.parent
+    with db() as con:
+        con.execute('DELETE FROM files WHERE job_id=?',(jobid,))
+        con.execute("UPDATE jobs SET status='deleted',derivative_status='deleted',updated=? WHERE id=?",(time.time(),jobid))
+    log(f'已刪除影音 #{jobid}（移除 {removed} 個檔案）',jobid)
+
 class Handler(BaseHTTPRequestHandler):
     def log_message(self,*args):
         pass
@@ -955,7 +991,7 @@ class Handler(BaseHTTPRequestHandler):
                     mime='image/png' if head.startswith(b'\x89PNG') else 'image/webp' if head.startswith(b'RIFF') else 'image/jpeg'
                 return self.send_file(path,mime,attachment=not role.startswith('image/') or q.get('download')==['1'])
             if u.path=='/api/jobs':
-                where='1=1'; args=[]
+                where="j.status!='deleted'"; args=[]
                 if q.get('channel'):
                     where+=' AND j.channel_id=?'; args.append(int(q['channel'][0]))
                 if q.get('single'):
@@ -975,7 +1011,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self.respond(rows(f'SELECT * FROM (SELECT * FROM logs WHERE {where} ORDER BY id DESC LIMIT 300) ORDER BY id',args))
             if u.path=='/api/status':
                 return self.respond({'version':subprocess.check_output(ytdlp()+['--version'],text=True,timeout=10).strip(),
-                    'queues':rows('SELECT status,COUNT(*) AS count FROM jobs GROUP BY status'),
+                    'app_version':APP_VERSION,
+                    'queues':rows("SELECT status,COUNT(*) AS count FROM jobs WHERE status!='deleted' GROUP BY status"),
                     'live_poll_seconds':env_int('LIVE_POLL_SECONDS',30)})
             asset=re.fullmatch(r'/asset/channel/(\d+)/(avatar|banner)',u.path)
             if asset:
@@ -1096,6 +1133,21 @@ class Handler(BaseHTTPRequestHandler):
                 else:
                     # Keep downloaded history and in-flight jobs; disable subscription.
                     execute('UPDATE channels SET enabled=0 WHERE id=?',(cid,))
+                return self.respond({'ok':True})
+            match=re.fullmatch(r'/api/jobs/(\d+)/delete',route)
+            if match:
+                ip=self.headers.get('X-Real-IP') or self.client_address[0]
+                n,t=DELETE_FAILS.get(ip,(0,time.time()))
+                if time.time()-t>300:n,t=0,time.time()
+                if n>=5:
+                    return self.respond({'error':'密碼嘗試次數過多，請 5 分鐘後再試'},429)
+                password=os.getenv('WEB_PASSWORD','')
+                given=str(body.get('password',''))
+                if not password or not hmac.compare_digest(given.encode(),password.encode()):
+                    DELETE_FAILS[ip]=(n+1,t)
+                    return self.respond({'error':'密碼錯誤，未刪除'},403)
+                DELETE_FAILS.pop(ip,None)
+                delete_job(int(match[1]))
                 return self.respond({'ok':True})
             match=re.fullmatch(r'/api/jobs/(\d+)/retry',route)
             if match:

@@ -257,6 +257,49 @@ class VaultTests(unittest.TestCase):
             if f['role']=='mp3':self.assertEqual(info['streams'][0]['codec_name'],'mp3')
             if f['role']=='preview':self.assertEqual({s['codec_name'] for s in info['streams']},{'h264','aac'})
         self.assertEqual(app.rows('SELECT derivative_status FROM jobs')[0]['derivative_status'],'ready')
+    def test_delete_job_removes_files_and_stays_deleted(self):
+        key='abc123'
+        jid=app.enqueue(self.cid,'https://www.youtube.com/watch?v=abc123',key,'t')
+        folder=app.MEDIA/'ch'/str(jid);folder.mkdir(parents=True)
+        video=folder/'v.mkv';video.write_bytes(b'x');(folder/'x.info.json').write_text('{}');outside=Path(self.tmp.name)/'keep.txt';outside.write_text('keep')
+        app.register_file(jid,video,'video')
+        app.execute("UPDATE jobs SET status='done',derivative_status='ready' WHERE id=?",(jid,))
+        app.delete_job(jid)
+        self.assertFalse(video.exists());self.assertFalse(folder.exists());self.assertFalse(folder.parent.exists());self.assertTrue(outside.exists())
+        self.assertEqual(app.rows('SELECT status FROM jobs WHERE id=?',(jid,))[0]['status'],'deleted')
+        self.assertEqual(app.rows('SELECT * FROM files WHERE job_id=?',(jid,)),[])
+        self.assertEqual(app.enqueue(self.cid,'https://www.youtube.com/watch?v=abc123',key,'t'),jid)
+        self.assertEqual(app.rows('SELECT status FROM jobs WHERE id=?',(jid,))[0]['status'],'deleted')
+    def test_delete_job_refuses_active(self):
+        jid=app.enqueue(self.cid,'https://www.youtube.com/watch?v=live1','live1','t')
+        for status in ('queued','downloading','recording'):
+            app.execute('UPDATE jobs SET status=? WHERE id=?',(status,jid))
+            with self.assertRaises(ValueError):app.delete_job(jid)
+    def test_http_delete_requires_password(self):
+        with patch.dict(os.environ,{'WEB_USER':'admin','WEB_PASSWORD':'testing'}):
+            app.DELETE_FAILS.clear()
+            server=app.ThreadingHTTPServer(('127.0.0.1',0),app.Handler)
+            threading.Thread(target=server.serve_forever,daemon=True).start()
+            base=f'http://127.0.0.1:{server.server_port}'
+            headers={'Authorization':'Basic '+base64.b64encode(b'admin:testing').decode(),'Content-Type':'application/json'}
+            def post(path,body):
+                req=urllib.request.Request(base+path,data=json.dumps(body).encode(),headers=headers)
+                with urllib.request.urlopen(req) as r:return r.status,json.loads(r.read())
+            try:
+                jid=app.enqueue(None,'https://x.com/u/status/9','k9','t')
+                app.execute("UPDATE jobs SET status='failed' WHERE id=?",(jid,))
+                for bad in ({},{'password':'nope'}):
+                    with self.assertRaises(urllib.error.HTTPError) as e:post(f'/api/jobs/{jid}/delete',bad)
+                    self.assertEqual(e.exception.code,403)
+                self.assertEqual(app.rows('SELECT status FROM jobs WHERE id=?',(jid,))[0]['status'],'failed')
+                self.assertEqual(post(f'/api/jobs/{jid}/delete',{'password':'testing'})[0],200)
+                self.assertEqual(app.rows('SELECT status FROM jobs WHERE id=?',(jid,))[0]['status'],'deleted')
+                req=urllib.request.Request(base+'/api/jobs?single=1',headers=headers)
+                with urllib.request.urlopen(req) as r:self.assertEqual(json.loads(r.read()),[])
+                req=urllib.request.Request(base+'/api/status',headers=headers)
+                with urllib.request.urlopen(req) as r:self.assertEqual(json.loads(r.read())['app_version'],app.APP_VERSION)
+            finally:
+                server.shutdown();server.server_close()
     def test_http_auth_subscription_and_download(self):
         with patch.dict(os.environ,{'WEB_USER':'admin','WEB_PASSWORD':'testing'}):
             server=app.ThreadingHTTPServer(('127.0.0.1',0),app.Handler)
